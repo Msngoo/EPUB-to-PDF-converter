@@ -164,10 +164,10 @@ The converter uses a **single-document approach** for optimal quality:
 ### Why Single-Document?
 
 Unlike chunk-and-merge approaches, rendering the entire book as one PDF:
-- ✅ Preserves internal hyperlinks
-- ✅ Maintains consistent styling across chapters
-- ✅ Avoids merge artifacts
-- ✅ More memory-efficient than expected (WeasyPrint streams rendering)
+- Preserves internal hyperlinks
+- Maintains consistent styling across chapters
+- Avoids merge artifacts
+- More memory-efficient than expected (WeasyPrint streams rendering)
 
 ## Troubleshooting
 
