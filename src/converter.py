@@ -127,15 +127,73 @@ def collect_css_files(book, base_path):
     
     return '\n\n'.join(css_content)
 
-def fix_internal_links(soup, current_file_id, all_file_ids):
+def build_global_id_registry(book, spine_items, base_root):
     """
-    Rewrite internal hyperlinks to work within a single document.
-    Handles cross-file references by prefixing with target file ID.
+    Pass 1: Scan all chapters and build a mapping of original IDs to prefixed IDs.
+    Returns:
+        - id_registry: {original_id: prefixed_id, "file.xhtml#id": prefixed_id}
+        - file_to_prefix: {file_path: chapter_prefix}
+    """
+    id_registry = {}
+    file_to_prefix = {}
+    
+    logger.info("Building global ID registry (Pass 1)...")
+    
+    for item_id, _ in spine_items:
+        try:
+            item = book.get_item_with_id(item_id)
+            
+            if not item or not is_html_content(item):
+                continue
+            
+            # Get content
+            try:
+                content = item.get_content().decode('utf-8', errors='ignore')
+            except:
+                content = item.content.decode('utf-8', errors='ignore')
+            
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Generate unique chapter prefix from full file path to avoid collisions
+            chapter_prefix = item.file_name.replace('/', '_').replace('\\', '_')
+            chapter_prefix = os.path.splitext(chapter_prefix)[0]
+            
+            # Store the mapping from file path to prefix
+            file_to_prefix[item.file_name] = chapter_prefix
+            
+            # Register all IDs in this chapter
+            for element in soup.find_all(id=True):
+                original_id = element['id']
+                prefixed_id = f"{chapter_prefix}_{original_id}"
+                
+                # Store both formats for lookup flexibility
+                id_registry[original_id] = prefixed_id  # For same-file refs
+                id_registry[f"{item.file_name}#{original_id}"] = prefixed_id  # For cross-file refs
+                
+                # Also handle just the basename for cross-file refs
+                basename = os.path.basename(item.file_name)
+                id_registry[f"{basename}#{original_id}"] = prefixed_id
+            
+            logger.debug(f"Registered IDs from: {item.file_name} (prefix: {chapter_prefix})")
+            
+        except Exception as e:
+            logger.warning(f"Error scanning {item_id} for registry: {e}")
+            continue
+    
+    logger.info(f"Registry complete: {len(id_registry)} ID mappings, {len(file_to_prefix)} files")
+    return id_registry, file_to_prefix
+
+
+def fix_internal_links_with_registry(soup, current_file_path, current_prefix, id_registry, file_to_prefix):
+    """
+    Pass 2: Update links using the global ID registry.
     
     Args:
         soup: BeautifulSoup object of current chapter
-        current_file_id: ID of the current file (e.g., "xhtml_13_chapter01")
-        all_file_ids: Set of all file IDs in the document for validation
+        current_file_path: Full file path of current chapter (e.g., "OEBPS/text/ch01.xhtml")
+        current_prefix: Chapter prefix for this file (e.g., "OEBPS_text_ch01")
+        id_registry: Global mapping of IDs
+        file_to_prefix: Mapping of file paths to their prefixes
     """
     for a in soup.find_all('a', href=True):
         href = a['href']
@@ -144,34 +202,70 @@ def fix_internal_links(soup, current_file_id, all_file_ids):
         if href.startswith(('http://', 'https://', 'mailto:', 'tel:')):
             continue
         
-        # Handle page number references (special case - remove link functionality)
+        # Handle page number references (remove functionality)
         if '#page_' in href:
-            # Convert page links to plain text since page numbers won't match
             anchor_id = href.split('#')[1] if '#' in href else None
             if anchor_id and anchor_id.startswith('page_'):
-                # Keep the text but remove the link
                 a.unwrap()
                 continue
         
-        # Parse file and anchor
+        # Parse href
         if '#' in href:
-            parts = href.split('#')
-            file_part = parts[0]
-            anchor_part = parts[1]
+            file_part, anchor_part = href.split('#', 1)
             
-            if file_part and file_part.endswith(('.html', '.xhtml', '.htm')):
-                # Cross-file reference: extract target file ID
-                target_file_id = os.path.splitext(os.path.basename(file_part))[0]
-                # Link will be: #targetfile_anchorid
-                a['href'] = f"#{target_file_id}_{anchor_part}"
-            else:
-                # Same-file reference: prefix with current file
-                a['href'] = f"#{current_file_id}_{anchor_part}"
+            if file_part:
+                # Cross-file reference
+                # Try different lookup formats
+                lookup_keys = [
+                    f"{file_part}#{anchor_part}",  # Full path with anchor
+                    f"{os.path.basename(file_part)}#{anchor_part}",  # Basename with anchor
+                ]
                 
+                # Try to resolve the target directory relative to current file
+                if not file_part.startswith('/'):
+                    current_dir = os.path.dirname(current_file_path)
+                    resolved_path = os.path.normpath(os.path.join(current_dir, file_part))
+                    lookup_keys.append(f"{resolved_path}#{anchor_part}")
+                
+                found = False
+                for key in lookup_keys:
+                    if key in id_registry:
+                        a['href'] = f"#{id_registry[key]}"
+                        found = True
+                        break
+                
+                if not found:
+                    logger.warning(f"Broken cross-file link in {current_file_path}: {href} (tried: {lookup_keys})")
+            else:
+                # Same-file reference
+                prefixed_anchor = f"{current_prefix}_{anchor_part}"
+                if anchor_part in id_registry:
+                    # If the anchor is registered globally, use its prefixed version
+                    a['href'] = f"#{id_registry[anchor_part]}"
+                else:
+                    # Fallback: use current file's prefix
+                    a['href'] = f"#{prefixed_anchor}"
+                    logger.debug(f"Same-file link fallback: {href} -> {a['href']}")
+                    
         elif href.endswith(('.html', '.xhtml', '.htm')):
-            # Link to a file without anchor - link to the file's section
-            target_file_id = os.path.splitext(os.path.basename(href))[0]
-            a['href'] = f"#{target_file_id}"
+            # Link to a file without anchor - link to the chapter section
+            # Try to find the target file's prefix
+            lookup_keys = [href, os.path.basename(href)]
+            
+            if not href.startswith('/'):
+                current_dir = os.path.dirname(current_file_path)
+                resolved_path = os.path.normpath(os.path.join(current_dir, href))
+                lookup_keys.append(resolved_path)
+            
+            found = False
+            for key in lookup_keys:
+                if key in file_to_prefix:
+                    a['href'] = f"#{file_to_prefix[key]}"
+                    found = True
+                    break
+            
+            if not found:
+                logger.warning(f"Broken file link in {current_file_path}: {href}")
 
 def extract_body_content(soup):
     """
@@ -210,6 +304,12 @@ def process_epub(input_path, output_path, temp_dir):
     
     chapter_htmls = []
     processed_count = 0
+
+    # Build global ID registry BEFORE processing chapters
+    logger.info("Pass 1: Building global ID registry...")
+    id_registry, file_to_prefix = build_global_id_registry(book, spine_items, base_root)
+    logger.info(f"Registry complete: {len(file_to_prefix)} files indexed")
+
     
     logger.info("Processing chapters...")
     for i, (item_id, _) in enumerate(tqdm(spine_items, desc="Building master document")):
@@ -228,18 +328,20 @@ def process_epub(input_path, output_path, temp_dir):
             # Parse HTML
             soup = BeautifulSoup(content, 'html.parser')
             
-            # Add an ID to the chapter container for internal linking
-            chapter_id = os.path.splitext(os.path.basename(item.file_name))[0]
+            # Get the chapter prefix from registry (using full path for uniqueness)
+            chapter_prefix = file_to_prefix.get(item.file_name)
             
-            # Collect all file IDs for validation (do this once before the loop ideally)
-            # For now, we'll pass None and skip validation
-            all_file_ids = None
+            if not chapter_prefix:
+                # Fallback if not in registry
+                chapter_prefix = item.file_name.replace('/', '_').replace('\\', '_')
+                chapter_prefix = os.path.splitext(chapter_prefix)[0]
+                logger.warning(f"Chapter {item.file_name} not in registry, using fallback prefix")
             
-            # Fix internal links FIRST (convert file-based to anchor-based with chapter prefixes)
-            fix_internal_links(soup, chapter_id, all_file_ids)
+            # Fix internal links using global registry
+            fix_internal_links_with_registry(soup, item.file_name, chapter_prefix, id_registry, file_to_prefix)
             
-            # Then deduplicate IDs (this adds the same prefix to all IDs in this chapter)
-            deduplicate_ids(soup, chapter_id)
+            # Deduplicate IDs
+            deduplicate_ids(soup, chapter_prefix)
             
             # Fix image paths - need to pass the HTML file's path for relative resolution
             html_file_path = os.path.join(base_root, item.file_name)
@@ -248,8 +350,8 @@ def process_epub(input_path, output_path, temp_dir):
             # Extract body content
             body_content = extract_body_content(soup)
             
-            # Wrap in a section with ID for navigation
-            section_wrapper = f'<section id="{chapter_id}" class="chapter">\n{body_content}\n</section>'
+            # Wrap in a section with ID for navigation (use chapter_prefix for consistency)
+            section_wrapper = f'<section id="{chapter_prefix}" class="chapter">\n{body_content}\n</section>'
             
             chapter_htmls.append(section_wrapper)
             processed_count += 1
