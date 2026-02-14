@@ -127,6 +127,262 @@ def collect_css_files(book, base_path):
     
     return '\n\n'.join(css_content)
 
+def extract_toc_with_hierarchy(book):
+    """
+    Extract the hierarchical table of contents from EPUB.
+    Returns a list of tuples: (level, title, href)
+    where level indicates indentation depth (0 = root, 1 = child, etc.)
+    """
+    toc_entries = []
+    
+    def process_toc_item(item, level=0):
+        """Recursively process TOC items."""
+        if isinstance(item, tuple):
+            # Format: (Section, [children]) or (title, href)
+            if len(item) == 2:
+                section, children = item
+                if hasattr(section, 'title') and hasattr(section, 'href'):
+                    # It's a Section object
+                    toc_entries.append((level, section.title, section.href))
+                    # Process children
+                    if isinstance(children, list):
+                        for child in children:
+                            process_toc_item(child, level + 1)
+                elif isinstance(section, str):
+                    # Format: (title, href)
+                    toc_entries.append((level, section, children))
+        elif hasattr(item, 'title') and hasattr(item, 'href'):
+            # It's a Section object directly
+            toc_entries.append((level, item.title, item.href))
+        elif isinstance(item, list):
+            # It's a list of items
+            for subitem in item:
+                process_toc_item(subitem, level)
+    
+    # Get TOC from book
+    try:
+        toc = book.toc
+        if isinstance(toc, list):
+            for item in toc:
+                process_toc_item(item, 0)
+        logger.info(f"Extracted {len(toc_entries)} TOC entries")
+    except Exception as e:
+        logger.warning(f"Could not extract TOC: {e}")
+        return []
+    
+    return toc_entries
+
+def build_anchor_to_page_map(pdf_path, id_registry, file_to_prefix):
+    """
+    Parse the PDF to find which page each anchor ID appears on.
+    Returns a dict mapping anchor_id -> page_number (0-indexed).
+    """
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        try:
+            from PyPDF2 import PdfReader
+        except ImportError:
+            logger.error("pypdf or PyPDF2 not installed. Cannot map anchors to pages.")
+            return {}
+    
+    logger.info("Scanning PDF pages to map anchors...")
+    reader = PdfReader(pdf_path)
+    anchor_to_page = {}
+    
+    total_pages = len(reader.pages)
+    
+    # Build a set of all possible anchor IDs we're looking for
+    all_anchor_ids = set()
+    for key in id_registry.keys():
+        all_anchor_ids.add(key)
+        # Also add just the anchor part after #
+        if '#' in key:
+            all_anchor_ids.add(key.split('#', 1)[1])
+    
+    for value in id_registry.values():
+        all_anchor_ids.add(value)
+    
+    for value in file_to_prefix.values():
+        all_anchor_ids.add(value)
+    
+    # Search through each page
+    found_count = 0
+    for page_num in range(total_pages):
+        try:
+            page = reader.pages[page_num]
+            
+            # Extract text content
+            text = page.extract_text() if hasattr(page, 'extract_text') else ""
+            
+            # Also check annotations and links
+            if '/Annots' in page:
+                annotations = page['/Annots']
+                if annotations:
+                    for annot in annotations:
+                        annot_obj = annot.get_object()
+                        # Check for named destinations or anchors
+                        if '/Dest' in annot_obj:
+                            dest = str(annot_obj['/Dest'])
+                            for anchor_id in all_anchor_ids:
+                                if anchor_id in dest:
+                                    if anchor_id not in anchor_to_page:
+                                        anchor_to_page[anchor_id] = page_num
+                                        found_count += 1
+            
+            # Search for anchor IDs in the text content
+            # WeasyPrint may embed IDs as part of the rendered content
+            for anchor_id in all_anchor_ids:
+                if anchor_id in text and anchor_id not in anchor_to_page:
+                    anchor_to_page[anchor_id] = page_num
+                    found_count += 1
+            
+        except Exception as e:
+            logger.debug(f"Error scanning page {page_num}: {e}")
+            continue
+    
+    logger.info(f"Mapped {found_count} anchors to pages (out of {len(all_anchor_ids)} total)")
+    
+    return anchor_to_page
+
+def add_bookmarks_to_pdf(pdf_path, toc_entries, id_registry, file_to_prefix):
+    """
+    Add hierarchical bookmarks to an existing PDF file with accurate page numbers.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        toc_entries: List of (level, title, href) tuples from extract_toc_with_hierarchy
+        id_registry: Global ID registry mapping
+        file_to_prefix: File to prefix mapping
+    """
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError:
+        try:
+            from PyPDF2 import PdfReader, PdfWriter
+        except ImportError:
+            logger.error("pypdf or PyPDF2 not installed. Cannot add bookmarks.")
+            return
+    
+    import os
+    
+    logger.info(f"Adding bookmarks to PDF: {len(toc_entries)} entries")
+    
+    # First, build a map of anchor IDs to page numbers
+    anchor_to_page = build_anchor_to_page_map(pdf_path, id_registry, file_to_prefix)
+    
+    # Read the existing PDF
+    reader = PdfReader(pdf_path)
+    writer = PdfWriter()
+    
+    # Copy all pages
+    for page in reader.pages:
+        writer.add_page(page)
+    
+    # Build bookmark hierarchy
+    # Stack to track parent bookmarks: [(level, bookmark_object), ...]
+    parent_stack = []
+    bookmarks_added = 0
+    bookmarks_skipped = 0
+    
+    for level, title, href in toc_entries:
+        try:
+            # Parse the href to get the target ID
+            target_id = None
+            page_num = 0  # Default to first page
+            
+            if '#' in href:
+                file_part, anchor_part = href.split('#', 1)
+                
+                # Try to resolve using the ID registry
+                lookup_keys = [
+                    href,  # Full href as-is
+                    f"{file_part}#{anchor_part}",
+                    anchor_part,  # Just the anchor
+                ]
+                
+                # Add basename variant
+                if file_part:
+                    basename = os.path.basename(file_part)
+                    lookup_keys.append(f"{basename}#{anchor_part}")
+                
+                # Find the prefixed ID in registry
+                for key in lookup_keys:
+                    if key in id_registry:
+                        target_id = id_registry[key]
+                        break
+                
+                # If not found in registry, try file_to_prefix for file-only
+                if not target_id and file_part:
+                    for key in [file_part, os.path.basename(file_part)]:
+                        if key in file_to_prefix:
+                            target_id = file_to_prefix[key]
+                            break
+                
+                # Last resort: use the anchor directly
+                if not target_id:
+                    target_id = anchor_part
+                    
+            elif href.endswith(('.html', '.xhtml', '.htm')):
+                # File-only reference (no anchor)
+                lookup_keys = [href, os.path.basename(href)]
+                for key in lookup_keys:
+                    if key in file_to_prefix:
+                        target_id = file_to_prefix[key]
+                        break
+            
+            # Look up the page number for this target ID
+            if target_id:
+                # Try various forms of the target ID
+                search_keys = [
+                    target_id,
+                    target_id.lower(),
+                    target_id.replace('_', '-'),
+                ]
+                
+                for key in search_keys:
+                    if key in anchor_to_page:
+                        page_num = anchor_to_page[key]
+                        break
+            
+            # Adjust the parent stack to the current level
+            while len(parent_stack) > 0 and parent_stack[-1][0] >= level:
+                parent_stack.pop()
+            
+            # Determine the parent bookmark
+            parent = parent_stack[-1][1] if parent_stack else None
+            
+            # Add the bookmark
+            new_bookmark = writer.add_outline_item(
+                title=title,
+                page_number=page_num,
+                parent=parent
+            )
+            
+            # Add to stack for potential children
+            parent_stack.append((level, new_bookmark))
+            
+            bookmarks_added += 1
+            logger.debug(f"Added bookmark: {'  ' * level}{title} -> page {page_num + 1}")
+            
+        except Exception as e:
+            logger.warning(f"Error adding bookmark '{title}': {e}")
+            bookmarks_skipped += 1
+            continue
+    
+    # Write the PDF with bookmarks
+    temp_path = pdf_path + ".tmp"
+    with open(temp_path, 'wb') as output_file:
+        writer.write(output_file)
+    
+    # Replace the original file
+    import shutil
+    shutil.move(temp_path, pdf_path)
+    
+    logger.info(f"✓ Successfully added {bookmarks_added} bookmarks to PDF")
+    if bookmarks_skipped > 0:
+        logger.warning(f"  Skipped {bookmarks_skipped} bookmarks due to errors")
+
 def build_global_id_registry(book, spine_items, base_root):
     """
     Pass 1: Scan all chapters and build a mapping of original IDs to prefixed IDs.
@@ -310,6 +566,10 @@ def process_epub(input_path, output_path, temp_dir):
     id_registry, file_to_prefix = build_global_id_registry(book, spine_items, base_root)
     logger.info(f"Registry complete: {len(file_to_prefix)} files indexed")
 
+    # Extract TOC structure for bookmarks
+    logger.info("Extracting table of contents...")
+    toc_entries = extract_toc_with_hierarchy(book)
+
     
     logger.info("Processing chapters...")
     for i, (item_id, _) in enumerate(tqdm(spine_items, desc="Building master document")):
@@ -428,6 +688,13 @@ def process_epub(input_path, output_path, temp_dir):
         
         final_size = os.path.getsize(output_path)
         logger.info(f"✓ PDF created successfully: {final_size:,} bytes ({final_size/1024/1024:.1f} MB)")
+
+        # Add bookmarks to the PDF
+        if toc_entries:
+            logger.info("Adding table of contents bookmarks...")
+            add_bookmarks_to_pdf(output_path, toc_entries, id_registry, file_to_prefix)
+        else:
+            logger.warning("No TOC found in EPUB, skipping bookmark creation")
         
     except Exception as e:
         logger.error(f"Error rendering PDF: {e}")
